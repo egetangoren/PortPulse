@@ -9,12 +9,21 @@ Author: egetangoren
 License: MIT
 """
 
+import argparse
 import json
 import os
 import queue
 import socket
+import sys
 import threading
+import time
 from typing import Any, Dict, List, Optional
+
+from colorama import Fore, Style, init
+from tabulate import tabulate
+
+# Initialize colorama for cross-platform terminal color support.
+init(autoreset=True)
 
 
 class PortScanner:
@@ -296,3 +305,262 @@ class PortScanner:
 
         # Return results sorted by port number.
         return sorted(results, key=lambda x: x["port"])
+
+
+def parse_ports(port_string: str, signatures: Dict[str, Any]) -> List[int]:
+    """Parses a user-provided port specification into a list of integers.
+
+    Supports three input formats:
+        - Comma-separated values: "22,80,443"
+        - Hyphen-delimited range: "20-100"
+        - Default: If None or empty, returns all ports from the signature database.
+
+    Args:
+        port_string: The raw port specification string from the CLI.
+            Can be None to use the default signature-based port list.
+        signatures: The loaded signature database dictionary, used
+            to determine default ports when no specification is given.
+
+    Returns:
+        A sorted list of unique integer port numbers to scan.
+
+    Raises:
+        SystemExit: If the port string contains invalid values that
+            cannot be parsed as integers or valid ranges.
+    """
+    if not port_string:
+        # Default: scan all ports defined in the signature database.
+        return sorted([int(port) for port in signatures.keys()])
+
+    ports: List[int] = []
+
+    # Check if the input is a range (e.g., "20-100").
+    if "-" in port_string and "," not in port_string:
+        try:
+            parts: List[str] = port_string.split("-")
+            start: int = int(parts[0])
+            end: int = int(parts[1])
+
+            if start > end:
+                print(f"{Fore.RED}[!] Error: Invalid port range. "
+                      f"Start ({start}) must be <= End ({end}).")
+                sys.exit(1)
+
+            if start < 1 or end > 65535:
+                print(f"{Fore.RED}[!] Error: Port numbers must be "
+                      f"between 1 and 65535.")
+                sys.exit(1)
+
+            ports = list(range(start, end + 1))
+        except (ValueError, IndexError):
+            print(f"{Fore.RED}[!] Error: Invalid port range format. "
+                  f"Use 'START-END' (e.g., '20-100').")
+            sys.exit(1)
+    else:
+        # Comma-separated values (e.g., "22,80,443").
+        try:
+            for part in port_string.split(","):
+                port: int = int(part.strip())
+                if 1 <= port <= 65535:
+                    ports.append(port)
+                else:
+                    print(f"{Fore.YELLOW}[!] Warning: Skipping invalid "
+                          f"port number {port}. Must be 1-65535.")
+        except ValueError:
+            print(f"{Fore.RED}[!] Error: Invalid port format. Use "
+                  f"comma-separated values (e.g., '22,80,443') or "
+                  f"a range (e.g., '20-100').")
+            sys.exit(1)
+
+    return sorted(list(set(ports)))
+
+
+def print_banner(target: str, port_count: int, thread_count: int) -> None:
+    """Displays the PortPulse ASCII art banner and scan configuration.
+
+    Prints a stylized ASCII art header followed by the scan parameters
+    including target host, number of ports, and thread count.
+
+    Args:
+        target: The target IP address or hostname being scanned.
+        port_count: The total number of ports to be scanned.
+        thread_count: The number of concurrent threads to be used.
+    """
+    banner: str = f"""
+{Fore.CYAN}{Style.BRIGHT}
+ ██████╗  ██████╗ ██████╗ ████████╗██████╗ ██╗   ██╗██╗     ███████╗███████╗
+ ██╔══██╗██╔═══██╗██╔══██╗╚══██╔══╝██╔══██╗██║   ██║██║     ██╔════╝██╔════╝
+ ██████╔╝██║   ██║██████╔╝   ██║   ██████╔╝██║   ██║██║     ███████╗█████╗
+ ██╔═══╝ ██║   ██║██╔══██╗   ██║   ██╔═══╝ ██║   ██║██║     ╚════██║██╔══╝
+ ██║     ╚██████╔╝██║  ██║   ██║   ██║     ╚██████╔╝███████╗███████║███████╗
+ ╚═╝      ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝      ╚═════╝ ╚══════╝╚══════╝╚══════╝
+{Style.RESET_ALL}
+{Fore.WHITE}  Multi-threaded Port Scanner & Banner Grabber{Style.RESET_ALL}
+{Fore.BLUE}  ─────────────────────────────────────────────{Style.RESET_ALL}
+"""
+    print(banner)
+    print(f"  {Fore.YELLOW}[*]{Fore.WHITE} Target   : {Fore.GREEN}{target}")
+    print(f"  {Fore.YELLOW}[*]{Fore.WHITE} Ports    : {Fore.GREEN}{port_count}")
+    print(f"  {Fore.YELLOW}[*]{Fore.WHITE} Threads  : {Fore.GREEN}{thread_count}")
+    print(f"  {Fore.BLUE}─────────────────────────────────────────────{Style.RESET_ALL}")
+    print()
+
+
+def display_results(
+    results: List[Dict[str, Any]],
+    elapsed_time: float
+) -> None:
+    """Formats and displays scan results as a colored ASCII table.
+
+    Uses the tabulate library to render open port results in a
+    grid-formatted table with colored status indicators. Also prints
+    a summary line with the total number of open ports found and
+    the total scan duration.
+
+    Args:
+        results: A list of dictionaries containing scan results.
+            Each dictionary must have keys: 'port', 'status',
+            'service', and 'banner'.
+        elapsed_time: The total scan duration in seconds.
+    """
+    if not results:
+        print(f"  {Fore.YELLOW}[!] No open ports found.{Style.RESET_ALL}")
+        print(f"  {Fore.BLUE}[*] Scan completed in "
+              f"{elapsed_time:.2f} seconds.{Style.RESET_ALL}")
+        return
+
+    # Build table rows with colored status.
+    table_data: List[List[str]] = []
+    for entry in results:
+        banner_display: str = entry["banner"][:60] + "..." \
+            if len(entry["banner"]) > 60 else entry["banner"]
+        if not banner_display:
+            banner_display = f"{Fore.YELLOW}N/A{Style.RESET_ALL}"
+
+        table_data.append([
+            f"{Fore.CYAN}{entry['port']}{Style.RESET_ALL}",
+            f"{Fore.GREEN}{entry['status'].upper()}{Style.RESET_ALL}",
+            f"{Fore.WHITE}{entry['service']}{Style.RESET_ALL}",
+            banner_display
+        ])
+
+    headers: List[str] = [
+        f"{Fore.WHITE}{Style.BRIGHT}PORT{Style.RESET_ALL}",
+        f"{Fore.WHITE}{Style.BRIGHT}STATUS{Style.RESET_ALL}",
+        f"{Fore.WHITE}{Style.BRIGHT}SERVICE{Style.RESET_ALL}",
+        f"{Fore.WHITE}{Style.BRIGHT}BANNER{Style.RESET_ALL}"
+    ]
+
+    print(tabulate(table_data, headers=headers, tablefmt="fancy_grid"))
+    print()
+    print(f"  {Fore.GREEN}[+] {len(results)} open port(s) found.")
+    print(f"  {Fore.BLUE}[*] Scan completed in "
+          f"{elapsed_time:.2f} seconds.{Style.RESET_ALL}")
+
+
+def save_results_to_json(
+    results: List[Dict[str, Any]],
+    output_path: str,
+    target: str,
+    elapsed_time: float
+) -> None:
+    """Saves scan results to a JSON file.
+
+    Writes the scan results along with metadata (target, timestamp,
+    duration) to the specified output file in JSON format.
+
+    Args:
+        results: A list of dictionaries containing scan results.
+        output_path: The file path to write the JSON output to.
+        target: The target IP address or hostname that was scanned.
+        elapsed_time: The total scan duration in seconds.
+    """
+    output_data: Dict[str, Any] = {
+        "target": target,
+        "scan_duration_seconds": round(elapsed_time, 2),
+        "total_open_ports": len(results),
+        "results": results
+    }
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as file:
+            json.dump(output_data, file, indent=4, ensure_ascii=False)
+        print(f"  {Fore.GREEN}[+] Results saved to: {output_path}")
+    except IOError as error:
+        print(f"  {Fore.RED}[!] Error saving results: {error}")
+
+
+def main() -> None:
+    """Main entry point for the PortPulse CLI application.
+
+    Parses command-line arguments, initializes the scanner, executes
+    the multi-threaded port scan, and displays or saves the results.
+    """
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        prog="PortPulse",
+        description="Multi-threaded Port Scanner & Banner Grabber.",
+        epilog="Example: python scanner.py 192.168.1.1 -p 22,80,443 -t 20"
+    )
+
+    parser.add_argument(
+        "target",
+        type=str,
+        help="Target IP address or hostname to scan."
+    )
+    parser.add_argument(
+        "-p", "--ports",
+        type=str,
+        default=None,
+        help="Ports to scan. Comma-separated (e.g., '22,80,443') "
+             "or range (e.g., '20-100'). Defaults to common ports."
+    )
+    parser.add_argument(
+        "-t", "--threads",
+        type=int,
+        default=10,
+        help="Number of concurrent threads. Default: 10."
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=str,
+        default=None,
+        help="Save results to a JSON file (e.g., 'results.json')."
+    )
+
+    args: argparse.Namespace = parser.parse_args()
+
+    # Initialize the scanner.
+    scanner: PortScanner = PortScanner(target=args.target)
+
+    # Parse the port specification.
+    ports: List[int] = parse_ports(args.ports, scanner.signatures)
+
+    # Display the startup banner.
+    print_banner(args.target, len(ports), args.threads)
+
+    # Execute the scan and measure elapsed time.
+    print(f"  {Fore.YELLOW}[*] Scanning in progress..."
+          f"{Style.RESET_ALL}\n")
+
+    start_time: float = time.time()
+    results: List[Dict[str, Any]] = scanner.scan_range(
+        ip=args.target,
+        ports=ports,
+        thread_count=args.threads
+    )
+    end_time: float = time.time()
+    elapsed_time: float = end_time - start_time
+
+    # Display results.
+    display_results(results, elapsed_time)
+
+    # Optionally save results to JSON.
+    if args.output:
+        print()
+        save_results_to_json(results, args.output, args.target, elapsed_time)
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
