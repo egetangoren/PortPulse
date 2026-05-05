@@ -10,9 +10,11 @@ License: MIT
 """
 
 import json
-import socket
 import os
-from typing import Dict, Any, Optional
+import queue
+import socket
+import threading
+from typing import Any, Dict, List, Optional
 
 
 class PortScanner:
@@ -44,6 +46,7 @@ class PortScanner:
         self.target: str = target
         self.timeout: float = timeout
         self.signatures: Dict[str, Any] = self._load_signatures()
+        self._lock: threading.Lock = threading.Lock()
 
     def _load_signatures(self) -> Dict[str, Any]:
         """Loads the service signature database from the JSON file.
@@ -156,3 +159,140 @@ class PortScanner:
             return signature.get("service", "Unknown")
 
         return "Unknown"
+
+    def scan_port(self, ip: str, port: int) -> Optional[Dict[str, Any]]:
+        """Scans a single port on the target host.
+
+        Attempts to establish a TCP connection to the specified port. If the
+        port is open, performs banner grabbing and service identification.
+
+        Args:
+            ip: The target IP address or hostname.
+            port: The TCP port number to scan.
+
+        Returns:
+            A dictionary containing scan results for an open port with keys:
+                - 'port': The scanned port number.
+                - 'status': Always 'open' for returned results.
+                - 'service': The identified service name.
+                - 'banner': The captured banner string (may be empty).
+            Returns None if the port is closed or the connection was refused.
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.timeout)
+                result_code: int = sock.connect_ex((ip, port))
+
+                if result_code == 0:
+                    # Port is open. Attempt banner grabbing.
+                    banner: str = self.grab_banner(ip, port)
+                    service: str = self.identify_service(port, banner)
+
+                    return {
+                        "port": port,
+                        "status": "open",
+                        "service": service,
+                        "banner": banner
+                    }
+
+        except socket.timeout:
+            pass
+        except socket.error:
+            pass
+        except ConnectionRefusedError:
+            pass
+        except OSError:
+            pass
+
+        return None
+
+    def _worker(
+        self,
+        ip: str,
+        port_queue: queue.Queue,
+        results: List[Dict[str, Any]]
+    ) -> None:
+        """Worker thread function that processes ports from the queue.
+
+        Continuously pulls port numbers from the shared queue, scans each
+        port using the scan_port method, and appends successful results to
+        the shared results list in a thread-safe manner.
+
+        This method is designed to run as the target function for each
+        worker thread in the thread pool.
+
+        Args:
+            ip: The target IP address or hostname to scan.
+            port_queue: A thread-safe queue containing port numbers to scan.
+            results: A shared list where open port scan results are stored.
+                Access is synchronized using a threading lock.
+        """
+        while not port_queue.empty():
+            try:
+                port: int = port_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            result: Optional[Dict[str, Any]] = self.scan_port(ip, port)
+
+            if result is not None:
+                with self._lock:
+                    results.append(result)
+
+            port_queue.task_done()
+
+    def scan_range(
+        self,
+        ip: str,
+        ports: List[int],
+        thread_count: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Scans a range of ports concurrently using multiple threads.
+
+        Populates a thread-safe queue with the specified port numbers,
+        spawns the requested number of worker threads, and waits for all
+        threads to complete. Results are collected and returned sorted by
+        port number.
+
+        Args:
+            ip: The target IP address or hostname to scan.
+            ports: A list of TCP port numbers to scan.
+            thread_count: The number of concurrent worker threads to use.
+                Defaults to 10. The actual count is capped at the number
+                of ports to avoid spawning idle threads.
+
+        Returns:
+            A list of dictionaries representing open ports, sorted in
+            ascending order by port number. Each dictionary contains:
+                - 'port': The open port number.
+                - 'status': Always 'open'.
+                - 'service': The identified service name.
+                - 'banner': The captured banner text.
+        """
+        port_queue: queue.Queue = queue.Queue()
+        results: List[Dict[str, Any]] = []
+
+        # Populate the queue with target ports.
+        for port in ports:
+            port_queue.put(port)
+
+        # Cap the thread count to the number of ports to prevent idle threads.
+        effective_thread_count: int = min(thread_count, len(ports))
+
+        # Spawn worker threads.
+        threads: List[threading.Thread] = []
+        for _ in range(effective_thread_count):
+            thread: threading.Thread = threading.Thread(
+                target=self._worker,
+                args=(ip, port_queue, results),
+                daemon=True
+            )
+            thread.start()
+            threads.append(thread)
+
+        # Wait for all threads to finish.
+        for thread in threads:
+            thread.join()
+
+        # Return results sorted by port number.
+        return sorted(results, key=lambda x: x["port"])
